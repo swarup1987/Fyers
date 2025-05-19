@@ -12,9 +12,39 @@ from datetime import datetime, timedelta
 from holidays import is_trading_day
 import resampler
 
+# --- Strategy imports ---
+from deepseek_strategy import Intraday15MinStrategy
+from walkforward import WalkForwardBacktester
+
+import numbers  # for robust timestamp conversion
+
 logging.basicConfig(level=logging.INFO)
 
 symbol_data = load_symbol_master(r"C:\Fyers Database\symbol_master.json")
+
+# Global to hold the selected strategy instance and metadata for future usage
+active_strategy_instance = None
+active_strategy_key = None
+
+def to_human_time(ts):
+    import numbers
+    from datetime import datetime
+    try:
+        if ts is None:
+            return ""
+        if isinstance(ts, numbers.Number):
+            # Avoid nan and inf
+            if ts != ts or ts == float('inf') or ts == float('-inf'):
+                return ""
+            # If the number is too small for a timestamp, just show as is
+            if ts < 100000000:  # not a plausible UNIX timestamp
+                return str(ts)
+            return datetime.fromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M:%S')
+        if isinstance(ts, str) and ts.isdigit():
+            return datetime.fromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M:%S')
+        return str(ts)
+    except Exception:
+        return str(ts)
 
 def launch_gui():
     main = Tk()
@@ -89,9 +119,10 @@ def show_funds(parent):
         show_error(win, f"Error fetching funds: {str(e)}")
 
 def open_backtest_window(parent):
+    global active_strategy_instance, active_strategy_key
     win = Toplevel(parent)
     win.title("Backtest Interface")
-    win.geometry("900x500")
+    win.geometry("900x750")
 
     Label(win, text="Backtest interface").pack(pady=10)
 
@@ -147,7 +178,7 @@ def open_backtest_window(parent):
     result_label = Label(win, text="", fg="blue", font=("Arial", 10))
     result_label.pack(pady=10)
 
-    # Dropdown for timeframes
+    # --- Dropdown for timeframes ---
     timeframe_frame = Frame(win)
     timeframe_frame.pack(pady=10)
     Label(timeframe_frame, text="Select Resample Timeframe:").pack(side=LEFT, padx=5)
@@ -162,7 +193,6 @@ def open_backtest_window(parent):
     timeframe_dropdown.pack(side=LEFT, padx=5)
 
     def on_interval_change(*_):
-        # Set the interval in a normalized form for future use
         val = timeframe_var.get()
         if val == "5 min":
             active_interval_var.set("5min")
@@ -172,9 +202,36 @@ def open_backtest_window(parent):
             active_interval_var.set("1hour")
         else:
             active_interval_var.set("5min")
-        # (No fetching/resampling needed here, already done at symbol selection)
 
     timeframe_dropdown.bind("<<ComboboxSelected>>", on_interval_change)
+
+    # --- Dropdown for strategy selection ---
+    strategy_frame = Frame(win)
+    strategy_frame.pack(pady=10)
+    Label(strategy_frame, text="Select Strategy:").pack(side=LEFT, padx=5)
+    strategy_var = StringVar(value="deep.boll.vwap.rsi.macd")
+    strategy_dropdown = ttk.Combobox(
+        strategy_frame,
+        textvariable=strategy_var,
+        values=["deep.boll.vwap.rsi.macd"],  # Add more strategies as you create them
+        state="readonly",
+        width=30
+    )
+    strategy_dropdown.pack(side=LEFT, padx=5)
+
+    # --- Activate strategy instance on dropdown change ---
+    def on_strategy_change(*_):
+        global active_strategy_instance, active_strategy_key
+        selected = strategy_var.get()
+        active_strategy_key = selected
+        if selected == "deep.boll.vwap.rsi.macd":
+            active_strategy_instance = Intraday15MinStrategy()
+            result_label.config(text="Strategy 'deep.boll.vwap.rsi.macd' loaded and ready.", fg="green")
+        # Add further elif branches for future strategies
+
+    strategy_dropdown.bind("<<ComboboxSelected>>", on_strategy_change)
+    # Immediately call to set initial state
+    on_strategy_change()
 
     def show_current_resampled_data():
         interval = active_interval_var.get()
@@ -209,13 +266,7 @@ def open_backtest_window(parent):
             if i >= max_rows:
                 break
             ts = row["timestamp"]
-            if isinstance(ts, int) or (isinstance(ts, str) and str(ts).isdigit()):
-                try:
-                    ts_str = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    ts_str = str(ts)
-            else:
-                ts_str = str(ts)
+            ts_str = to_human_time(ts)
             tree.insert("", END, values=(
                 row.get("id", ""), row.get("symbol", ""), ts_str,
                 row.get("open", ""), row.get("high", ""), row.get("low", ""),
@@ -225,8 +276,88 @@ def open_backtest_window(parent):
             Label(display_win, text=f"Showing first {max_rows} rows (out of {len(data)})", fg="red").pack()
         Button(display_win, text="Close", command=display_win.destroy).pack(pady=10)
 
+    def on_backtest():
+        symbol = selected_symbol_var.get()
+        interval = active_interval_var.get()
+        strategy_key = strategy_var.get()
+        if not symbol:
+            messagebox.showwarning("Warning", "Please select a symbol.")
+            return
+        if not interval:
+            messagebox.showwarning("Warning", "Please select an interval.")
+            return
+        if not strategy_key:
+            messagebox.showwarning("Warning", "Please select a strategy.")
+            return
+        # Run walkforward backtest
+        try:
+            backtester = WalkForwardBacktester(
+                strategy_key=strategy_key,
+                interval=interval,
+                symbol=symbol,
+                capital=10000
+            )
+            results = backtester.run_backtest()
+            # Show results in a popup window
+            stats = results["stats"]
+            trades = results["trades"]
+            show_backtest_results(win, stats, trades)
+        except Exception as e:
+            messagebox.showerror("Error", f"Backtest failed: {e}")
+
     Button(win, text="Show", command=show_current_resampled_data).pack(pady=5)
+    Button(win, text="Backtest", command=on_backtest).pack(pady=5)
     Button(win, text="Close", command=win.destroy).pack(pady=30)
+
+def show_backtest_results(parent, stats, trades):
+    win = Toplevel(parent)
+    win.title("Backtest Results")
+    win.geometry("950x700")
+    stat_text = ""
+    for k, v in stats.items():
+        if isinstance(v, float):
+            stat_text += f"{k}: {v:.3f}\n"
+        else:
+            stat_text += f"{k}: {v}\n"
+
+    # Prepare trade lines for copying
+    trade_lines = []
+    header = "Entry Time,Exit Time,Direction,P&L,Exit Reason"
+    trade_lines.append(header)
+    for t in trades:
+        entry_time = to_human_time(t.get('entry_time', ''))
+        exit_time = to_human_time(t.get('exit_time', ''))
+        trade_lines.append(f"{entry_time},{exit_time},{t['direction']},{round(t['pl'],2)},{t['exit_reason']}")
+    trades_text = "\n".join(trade_lines)
+
+    # Place a Text widget for copiable output
+    results_box = Text(win, height=15, width=110, wrap='none', font=("Courier New", 10))
+    results_box.insert("1.0", "Backtest Statistics:\n" + stat_text + "\nTrades:\n" + trades_text)
+    results_box.config(state="disabled")
+    results_box.pack(pady=6)
+
+    # Copy button to clipboard
+    def copy_results():
+        win.clipboard_clear()
+        win.clipboard_append(results_box.get("1.0", END).rstrip())
+        win.update()  # keep clipboard after window closes
+
+    Button(win, text="Copy Results", command=copy_results).pack(pady=3)
+
+    # Treeview for nice display
+    Label(win, text="Tabular View", font=("Arial", 11, "bold")).pack()
+    frame = Frame(win)
+    frame.pack(fill=BOTH, expand=True, padx=8, pady=8)
+    tree = ttk.Treeview(frame, columns=("entry_time","exit_time","direction","pl","exit_reason"), show="headings")
+    for col in tree["columns"]:
+        tree.heading(col, text=col)
+        tree.column(col, width=150)
+    for t in trades:
+        entry_time = to_human_time(t.get('entry_time', ''))
+        exit_time = to_human_time(t.get('exit_time', ''))
+        tree.insert("", END, values=(entry_time, exit_time, t['direction'], round(t['pl'],2), t['exit_reason']))
+    tree.pack(fill=BOTH, expand=True)
+    Button(win, text="Close", command=win.destroy).pack(pady=10)
 
 def open_historical_data_window(parent):
     win = Toplevel(parent)
@@ -324,7 +455,7 @@ def open_historical_data_window(parent):
             tree.pack(fill=BOTH, expand=True)
 
             for row in rows:
-                readable_ts = datetime.fromtimestamp(int(row[0])).strftime("%Y-%m-%d %H:%M")
+                readable_ts = to_human_time(row[0])
                 tree.insert("", END, values=(readable_ts, *row[1:]))
 
         except Exception as e:
